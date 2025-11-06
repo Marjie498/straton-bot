@@ -1,2 +1,7 @@
 python-telegram-bot==21.*
 scikit-learn
+rapidfuzz
+rank_bm25
+flask
+openai
+faiss-cpu
