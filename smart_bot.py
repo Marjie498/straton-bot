@@ -1,12 +1,8 @@
-# smart_bot.py — LLM-RAG smart bot
-# - SQLite KB + Entities
-# - Hybrid retrieval (BM25 + TF-IDF) + semantic (FAISS)
-# - LLM fallback (OpenAI gpt-4o-mini) with strict grounding
-# - Admin: /teach, /entity, /alias
-# - Flask health endpoint for Render Free
-# - Admin-locked by ADMIN_ID
+# smart_bot.py
+# Telegram bot with: hybrid retrieval (BM25 + TF-IDF), structured entities with fuzzy matching,
+# optional LLM fallback (OpenAI), Flask health endpoint (Render Free), NumPy 2.0 safe.
 
-import os, re, sqlite3, json, threading
+import os, re, sqlite3, threading
 from typing import List, Tuple, Optional, Dict
 
 from telegram import Update
@@ -18,45 +14,58 @@ from sklearn.metrics.pairwise import cosine_similarity
 from rank_bm25 import BM25Okapi
 from rapidfuzz import process, fuzz
 
-# Embeddings + vector search
-import faiss
+# Optional LLM + vector semantic search
 import numpy as np
-from openai import OpenAI
+try:
+    import faiss                    # installed by 'faiss-cpu'
+    _HAS_FAISS = True
+except Exception:
+    _HAS_FAISS = False
 
-# Flask health
-from threading import Thread
+try:
+    from openai import OpenAI
+    _HAS_OPENAI = True
+except Exception:
+    _HAS_OPENAI = False
+
+# Flask health (keeps Render Web Service alive)
 from flask import Flask
+from threading import Thread
 
-# ==== CONFIG ====
+# ===================== CONFIG =====================
 TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # required for LLM/embeddings
-ADMIN_ID = 8075615491
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # optional
+ADMIN_ID = 8075615491                         # <- your numeric Telegram ID
 DB = "kb.db"
-EMB_DIM = 1536    # text-embedding-3-small
-FAQ_THRESHOLD = 0.60    # confidence threshold for direct FAQ answer
-NAME_SIM_THRESHOLD = 85 # RapidFuzz name match
-LLM_MODEL = "gpt-4o-mini"
-EMB_MODEL = "text-embedding-3-small"
-# ===============
 
-# Flask health (Render Free Web Service)
+FAQ_THRESHOLD = 0.60          # confidence for direct FAQ answers
+NAME_SIM_THRESHOLD = 85        # RapidFuzz 0..100 for entity name matches
+LLM_MODEL = "gpt-4o-mini"      # used if OPENAI_API_KEY is set
+EMB_MODEL = "text-embedding-3-small"
+EMB_DIM = 1536                 # embedding vector size
+# =================================================
+
+# -------- Flask tiny server (Render Free) --------
 app_flask = Flask(__name__)
 @app_flask.get("/")
 def health():
     return "ok", 200
+
 def run_flask():
     port = int(os.getenv("PORT", "10000"))
     app_flask.run(host="0.0.0.0", port=port)
 
+# ---------------- Utilities ----------------
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
-# ---------- DB ----------
+# ---------------- Database -----------------
 def init_db():
     with sqlite3.connect(DB) as c:
         c.execute("""CREATE TABLE IF NOT EXISTS faqs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            q TEXT NOT NULL UNIQUE, a TEXT NOT NULL)""")
+            q  TEXT NOT NULL UNIQUE,
+            a  TEXT NOT NULL)""")
         c.execute("""CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, last_name TEXT,
             joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
@@ -97,6 +106,7 @@ def add_entity(kind: str, name: str, value: str):
         c.execute("INSERT OR REPLACE INTO entities(kind,name,value) VALUES(?,?,?)",
                   (norm(kind), name.strip(), value.strip()))
         c.commit()
+
 def get_entities(kind: Optional[str]=None):
     with sqlite3.connect(DB) as c:
         if kind:
@@ -107,109 +117,112 @@ def add_alias(canonical: str, alias: str):
     with sqlite3.connect(DB) as c:
         c.execute("INSERT OR IGNORE INTO aliases(canonical,alias) VALUES(?,?)",(canonical.strip(),alias.strip()))
         c.commit()
-def get_alias_map():
+
+def get_alias_map() -> Dict[str, List[str]]:
     with sqlite3.connect(DB) as c:
         rows = c.execute("SELECT canonical,alias FROM aliases").fetchall()
-    mp: Dict[str,List[str]] = {}
-    for can,al in rows:
-        mp.setdefault(can,[]).append(al)
+    mp: Dict[str, List[str]] = {}
+    for can, al in rows:
+        mp.setdefault(can, []).append(al)
     return mp
 
-def add_synonym(term:str, alt:str):
+def add_synonym(term: str, alt: str):
     with sqlite3.connect(DB) as c:
         c.execute("INSERT OR IGNORE INTO synonyms(term,alt) VALUES(?,?)",(norm(term),norm(alt)))
         c.commit()
-def get_synonyms():
+
+def get_synonyms() -> Dict[str, List[str]]:
     with sqlite3.connect(DB) as c:
         rows = c.execute("SELECT term,alt FROM synonyms").fetchall()
-    mp: Dict[str,List[str]] = {}
+    mp: Dict[str, List[str]] = {}
     for t,a in rows:
-        mp.setdefault(t,[]).append(a)
+        mp.setdefault(t, []).append(a)
     return mp
 
-# ---------- Retrieval indexes ----------
+# ------------- Retrieval indexes -------------
 _vectorizer = TfidfVectorizer(ngram_range=(1,2), lowercase=True)
 _lock = threading.Lock()
-cached_qs: List[str] = []
-cached_as: List[str] = []
-cached_ids: List[int] = []
-tfidf_m = None
-bm25 = None
-faiss_index = None
+_cached_ids: List[int] = []
+_cached_qs:  List[str] = []
+_cached_as:  List[str] = []
+_tfidf = None
+_bm25 = None
+_faiss_index = None
+
+def _minmax01(arr: np.ndarray) -> np.ndarray:
+    a = np.asarray(arr, dtype=float)
+    rng = np.ptp(a)  # NumPy 2-safe
+    if rng == 0:
+        return np.zeros_like(a, dtype=float)
+    return (a - a.min()) / (rng + 1e-9)
 
 def rebuild_indices_and_embeddings():
-    global cached_qs,cached_as,cached_ids,tfidf_m,bm25,faiss_index
+    """Build TF-IDF, BM25, and (optional) FAISS semantic index."""
+    global _cached_ids, _cached_qs, _cached_as, _tfidf, _bm25, _faiss_index
     rows = get_all_faqs()
-    cached_ids = [r[0] for r in rows]
-    cached_qs  = [r[1] for r in rows]
-    cached_as  = [r[2] for r in rows]
+    _cached_ids = [r[0] for r in rows]
+    _cached_qs  = [r[1] for r in rows]
+    _cached_as  = [r[2] for r in rows]
 
-    # TF-IDF + BM25
-    if cached_qs:
-        tfidf_m = _vectorizer.fit_transform(cached_qs)
-        bm25 = BM25Okapi([q.split() for q in cached_qs])
+    if _cached_qs:
+        _tfidf = _vectorizer.fit_transform(_cached_qs)
+        _bm25  = BM25Okapi([q.split() for q in _cached_qs])
     else:
-        tfidf_m = None
-        bm25 = None
+        _tfidf = None
+        _bm25 = None
 
-    # Embeddings (ensure entries exist)
-    if OPENAI_API_KEY and cached_qs:
+    # Build FAISS only if OpenAI key & faiss are available
+    if OPENAI_API_KEY and _HAS_OPENAI and _HAS_FAISS and _cached_qs:
+        from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
         with sqlite3.connect(DB) as c:
             existing = {row[0] for row in c.execute("SELECT faq_id FROM faq_embeddings").fetchall()}
-            need = [ (fid, q) for fid,q in zip(cached_ids, cached_qs) if fid not in existing ]
+            need = [(fid, q) for fid, q in zip(_cached_ids, _cached_qs) if fid not in existing]
             for fid, q in need:
                 emb = client.embeddings.create(model=EMB_MODEL, input=q).data[0].embedding
-                b = np.asarray(emb, dtype=np.float32).tobytes()
-                c.execute("INSERT OR REPLACE INTO faq_embeddings(faq_id,embedding) VALUES(?,?)",(fid,b))
+                c.execute("INSERT OR REPLACE INTO faq_embeddings(faq_id,embedding) VALUES(?,?)",
+                          (fid, np.asarray(emb, dtype=np.float32).tobytes()))
             c.commit()
-            # build FAISS
             embs = []
-            for fid in cached_ids:
-                ebytes = c.execute("SELECT embedding FROM faq_embeddings WHERE faq_id=?",(fid,)).fetchone()
-                if ebytes:
-                    emb = np.frombuffer(ebytes[0], dtype=np.float32)
-                    embs.append(emb)
-            if embs:
-                mat = np.vstack(embs).astype('float32')
-                faiss_index = faiss.IndexFlatIP(EMB_DIM)
-                # normalize for cosine
-                faiss.normalize_L2(mat)
-                faiss_index.add(mat)
-            else:
-                faiss_index = None
+            for fid in _cached_ids:
+                row = c.execute("SELECT embedding FROM faq_embeddings WHERE faq_id=?", (fid,)).fetchone()
+                if row:
+                    embs.append(np.frombuffer(row[0], dtype=np.float32))
+        if embs:
+            mat = np.vstack(embs).astype("float32")
+            faiss.normalize_L2(mat)
+            _faiss_index = faiss.IndexFlatIP(EMB_DIM)
+            _faiss_index.add(mat)
+        else:
+            _faiss_index = None
+    else:
+        _faiss_index = None
 
-def hybrid_rank(query: str):
-    """Return best FAQ index and a normalized score (0..1)."""
-    if not cached_qs:
-        return None, 0.0
-    # BM25
-    bm = bm25.get_scores(query.split()) if bm25 else np.zeros(len(cached_qs))
-    # TF-IDF cosine
-    cs = cosine_similarity(_vectorizer.transform([query]), tfidf_m)[0] if tfidf_m is not None else np.zeros(len(cached_qs))
-    # normalize
-    bm = (bm - bm.min()) / (bm.ptp() + 1e-9)
-    cs = (cs - cs.min()) / (cs.ptp() + 1e-9)
-    score = 0.6*bm + 0.4*cs
-    i = int(score.argmax())
-    return i, float(score[i])
+def hybrid_rank(query: str) -> Tuple[Optional[int], float]:
+    """Return (best_index, score in 0..1) using BM25 + TF-IDF."""
+    if not _cached_qs:
+        return (None, 0.0)
+    bm = _bm25.get_scores(query.split()) if _bm25 else np.zeros(len(_cached_qs))
+    cs = cosine_similarity(_vectorizer.transform([query]), _tfidf)[0] if _tfidf is not None else np.zeros(len(_cached_qs))
+    bm_n = _minmax01(bm)
+    cs_n = _minmax01(cs)
+    score = 0.6 * bm_n + 0.4 * cs_n
+    idx = int(score.argmax())
+    return (idx, float(score[idx]))
 
 def semantic_topk(query: str, k=3):
-    """Return top-k indices via FAISS cosine similarity + scores."""
-    if faiss_index is None or not OPENAI_API_KEY or not cached_qs:
+    """Top-k indices via FAISS cosine similarity (if available)."""
+    if not (_faiss_index is not None and OPENAI_API_KEY and _HAS_OPENAI and _HAS_FAISS and _cached_qs):
         return []
     client = OpenAI(api_key=OPENAI_API_KEY)
     emb = client.embeddings.create(model=EMB_MODEL, input=query).data[0].embedding
     vec = np.asarray(emb, dtype=np.float32).reshape(1, -1)
     faiss.normalize_L2(vec)
-    D, I = faiss_index.search(vec, min(k, len(cached_qs)))
-    out = []
-    for d,i in zip(D[0], I[0]):
-        out.append((int(i), float(d)))
-    return out
+    D, I = _faiss_index.search(vec, min(k, len(_cached_qs)))
+    return [(int(i), float(d)) for d, i in zip(D[0], I[0])]
 
-# ---------- Intent routing ----------
-def get_synonym_map_text(text: str) -> str:
+# ------------- Intent routing & entities -------------
+def expand_synonyms(text: str) -> str:
     syn = get_synonyms()
     toks = text.split()
     out=[]
@@ -227,8 +240,7 @@ def detect_birthday(text: str) -> Optional[str]:
     if not m:
         m = re.search(r"when\s+is\s+([A-Za-z][\w\s'.-]{0,40})\s*(birthday|bday)\??$", text, re.I)
     if m:
-        name = m.group(2) if m.lastindex and m.lastindex>=2 else m.group(1)
-        return name.strip()
+        return (m.group(2) if m.lastindex and m.lastindex>=2 else m.group(1)).strip()
     return None
 
 def entity_lookup(kind: str, name_query: str) -> Optional[str]:
@@ -236,10 +248,10 @@ def entity_lookup(kind: str, name_query: str) -> Optional[str]:
     if not rows: return None
     names = [r[1] for r in rows]
     alias_map = get_alias_map()
-    comps=[]; idx=[]
+    comps, idx = [], []
     for i,can in enumerate(names):
         comps.append(can); idx.append(i)
-        for al in alias_map.get(can,[]):
+        for al in alias_map.get(can, []):
             comps.append(al); idx.append(i)
     best = process.extractOne(name_query, comps, scorer=fuzz.WRatio)
     if best and best[1] >= NAME_SIM_THRESHOLD:
@@ -247,38 +259,39 @@ def entity_lookup(kind: str, name_query: str) -> Optional[str]:
         return rows[canonical_idx][2]
     return None
 
-# ---------- LLM ----------
-def llm_answer(query: str, passages: List[Tuple[str,str]]) -> str:
-    """
-    passages: list of (title, content). We ground the LLM strictly.
-    """
-    if not OPENAI_API_KEY:
+# ------------------- LLM -------------------
+def llm_answer(query: str, passages: List[Tuple[str, str]]) -> str:
+    """Strictly grounded LLM; never crashes if key/quota missing."""
+    if not (OPENAI_API_KEY and _HAS_OPENAI):
         return "I’m not sure yet."
-    sys_prompt = (
-        "You are a helpful assistant. Answer using ONLY the provided context. "
-        "If the answer is not present, say 'I don't know' and suggest teaching with /teach."
-    )
-    ctx_blocks = []
-    for i,(title,content) in enumerate(passages,1):
-        ctx_blocks.append(f"[{i}] {title}\n{content}")
-    context_str = "\n\n".join(ctx_blocks) if ctx_blocks else "No context."
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    msg = [
-        {"role":"system","content":sys_prompt},
-        {"role":"user","content":f"Question: {query}\n\nContext:\n{context_str}"}
-    ]
-    resp = client.chat.completions.create(model=LLM_MODEL, messages=msg, temperature=0.2)
-    return resp.choices[0].message.content.strip()
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        sys_prompt = (
+            "You are a helpful assistant. Answer using ONLY the provided context. "
+            "If the answer is not present, say 'I don't know' and suggest teaching with /teach."
+        )
+        ctx = "\n\n".join(f"[{i}] {t}\n{c}" for i,(t,c) in enumerate(passages,1)) or "No context."
+        resp = client.chat.completions.create(
+            model=LLM_MODEL, temperature=0.2,
+            messages=[
+                {"role":"system","content":sys_prompt},
+                {"role":"user","content":f"Question: {query}\n\nContext:\n{ctx}"}
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return "I couldn’t reach the language model right now. Try again later or teach me with /teach question | answer."
 
-# ---------- Handlers ----------
+# ----------------- Handlers -----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update)
     await update.message.reply_text(
-        "Hi! I’m your very smart bot 🤖\n"
-        "• Teach FAQ: /teach question | answer (admin)\n"
+        "Hi! I’m your smart bot 🤖\n"
+        "• Ask FAQs (price, refund policy, etc.)\n"
+        "• Birthdays: 'bday of Emmy', '/entity birthday | Emmy | January 14'\n"
+        "• Teach: /teach question | answer (admin)\n"
         "• Entities: /entity kind | name | value (admin)\n"
         "• Alias: /alias canonical | alias (admin)\n"
-        "• Examples: 'bday of Emmy', 'price', 'refund policy'\n"
     )
 
 async def teach_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -288,7 +301,7 @@ async def teach_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts)<2 or "|" not in parts[1]:
         return await update.message.reply_text("Usage:\n/teach question | answer")
     q,a = [s.strip() for s in parts[1].split("|",1)]
-    fid = add_faq(q,a)
+    add_faq(q,a)
     rebuild_indices_and_embeddings()
     await update.message.reply_text("Learned ✅")
 
@@ -308,55 +321,52 @@ async def alias_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.split(" ",1)
     if len(parts)<2 or "|" not in parts[1]:
         return await update.message.reply_text("Usage:\n/alias canonical | alias")
-    can,al = [s.strip() for s in parts[1].split("|",1)]
-    add_alias(can,al)
+    can, al = [s.strip() for s in parts[1].split("|",1)]
+    add_alias(can, al)
     await update.message.reply_text(f"Alias added: {al} → {can} ✅")
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = get_all_faqs()
-    if not rows:
-        return await update.message.reply_text("No FAQs yet. /teach question | answer")
-    text = "\n".join(f"{rid}. {q}" for rid,q,_ in rows[:200])
-    await update.message.reply_text("FAQ list:\n"+text)
+    if not rows: return await update.message.reply_text("No FAQs yet. /teach question | answer")
+    await update.message.reply_text("FAQ list:\n" + "\n".join(f"{rid}. {q}" for rid,q,_ in rows[:200]))
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update)
     raw = (update.message.text or "").strip()
     if not raw: return
     text = norm(raw)
-    text_expanded = get_synonym_map_text(text)
+    text_expanded = expand_synonyms(text)
 
-    # 1) Entities first (birthday demo)
+    # 1) Entities (birthday demo)
     name = detect_birthday(text_expanded)
     if name:
         val = entity_lookup("birthday", name)
         if val:
             return await update.message.reply_text(f"{name}: {val} 🎂")
 
-    # 2) Hybrid retrieval (BM25 + TF-IDF)
+    # 2) Hybrid retrieval
     idx, score = hybrid_rank(raw)
     if idx is not None and score >= FAQ_THRESHOLD:
-        return await update.message.reply_text(cached_as[idx])
+        return await update.message.reply_text(_cached_as[idx])
 
-    # 3) Semantic top-k + LLM fallback
+    # 3) Semantic + LLM fallback (optional)
     topk = semantic_topk(raw, k=3)
-    passages=[]
-    for i,_ in topk:
-        passages.append((cached_qs[i], cached_as[i]))
+    passages = [( _cached_qs[i], _cached_as[i]) for i,_ in topk]
     if not passages and idx is not None:
-        # include the best hybrid as context as a last resort
-        passages.append((cached_qs[idx], cached_as[idx]))
+        passages.append((_cached_qs[idx], _cached_as[idx]))
     answer = llm_answer(raw, passages)
     await update.message.reply_text(answer)
 
+# ---------------- Bootstrap ----------------
 def preload():
-    # minimal defaults
+    # Seed minimal data once
     if not get_all_faqs():
         add_faq("price", "Our base price is $25. Promos every Friday.")
         add_faq("cashapp", "Yes, we accept CashApp. Send $ to $YourTag and DM the receipt.")
         add_faq("support contact", "Email support@example.com or DM @YourHandle.")
     add_synonym("birthday","bday")
     add_synonym("price","rate")
+    # sample birthdays
     add_entity("birthday","Emmy","January 14")
     add_entity("birthday","Gigi","January 18")
     add_alias("Emmy","Emmi")
@@ -366,12 +376,13 @@ def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN not set")
     if not OPENAI_API_KEY:
-        print("WARNING: OPENAI_API_KEY not set — LLM fallback disabled")
+        print("NOTE: OPENAI_API_KEY not set — running in retrieval-only mode (no LLM fallback).")
+
     init_db()
     preload()
     rebuild_indices_and_embeddings()
 
-    # start Flask health
+    # Start the tiny web server so Render Free stays live
     Thread(target=run_flask, daemon=True).start()
 
     app = Application.builder().token(TOKEN).build()
@@ -382,7 +393,7 @@ def main():
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    print("LLM-RAG bot running…")
+    print("Smart bot running…")
     app.run_polling()
 
 if __name__ == "__main__":
