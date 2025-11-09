@@ -1,6 +1,6 @@
 # smart_bot.py
-# Telegram bot with: hybrid retrieval (BM25 + TF-IDF), structured entities with fuzzy matching,
-# optional LLM fallback (OpenAI), Flask health endpoint (Render Free), NumPy 2.0 safe.
+# Telegram bot: hybrid retrieval (BM25 + TF-IDF), structured entities + fuzzy names,
+# optional LLM fallback (OpenAI), Flask health (Render Free), NumPy 2–compatible.
 
 import os, re, sqlite3, threading
 from typing import List, Tuple, Optional, Dict
@@ -14,10 +14,12 @@ from sklearn.metrics.pairwise import cosine_similarity
 from rank_bm25 import BM25Okapi
 from rapidfuzz import process, fuzz
 
-# Optional LLM + vector semantic search
+# Numpy (NumPy 2 safe helpers)
 import numpy as np
+
+# Optional: FAISS + OpenAI (semantic + LLM)
 try:
-    import faiss                    # installed by 'faiss-cpu'
+    import faiss  # provided by 'faiss-cpu'
     _HAS_FAISS = True
 except Exception:
     _HAS_FAISS = False
@@ -28,24 +30,24 @@ try:
 except Exception:
     _HAS_OPENAI = False
 
-# Flask health (keeps Render Web Service alive)
+# Flask health server (keeps Render Free alive)
 from flask import Flask
 from threading import Thread
 
-# ===================== CONFIG =====================
+# =================== CONFIG ===================
 TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # optional
-ADMIN_ID = 8075615491                         # <- your numeric Telegram ID
+ADMIN_ID = 8075615491
+
 DB = "kb.db"
-
-FAQ_THRESHOLD = 0.60          # confidence for direct FAQ answers
-NAME_SIM_THRESHOLD = 85        # RapidFuzz 0..100 for entity name matches
-LLM_MODEL = "gpt-4o-mini"      # used if OPENAI_API_KEY is set
+FAQ_THRESHOLD = 0.60              # confidence threshold for direct FAQ answer
+NAME_SIM_THRESHOLD = 85           # RapidFuzz name similarity (0..100)
+LLM_MODEL = "gpt-4o-mini"         # OpenAI chat model (optional)
 EMB_MODEL = "text-embedding-3-small"
-EMB_DIM = 1536                 # embedding vector size
-# =================================================
+EMB_DIM = 1536
+# =============================================
 
-# -------- Flask tiny server (Render Free) --------
+# --------- Flask (Render Free health) ---------
 app_flask = Flask(__name__)
 @app_flask.get("/")
 def health():
@@ -58,6 +60,14 @@ def run_flask():
 # ---------------- Utilities ----------------
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+def _minmax01(arr: np.ndarray) -> np.ndarray:
+    """NumPy 2 safe [0,1] normalization."""
+    a = np.asarray(arr, dtype=float)
+    rng = np.ptp(a)  # == a.max() - a.min()
+    if rng == 0:
+        return np.zeros_like(a, dtype=float)
+    return (a - a.min()) / (rng + 1e-9)
 
 # ---------------- Database -----------------
 def init_db():
@@ -147,17 +157,10 @@ _cached_qs:  List[str] = []
 _cached_as:  List[str] = []
 _tfidf = None
 _bm25 = None
-_faiss_index = None
-
-def _minmax01(arr: np.ndarray) -> np.ndarray:
-    a = np.asarray(arr, dtype=float)
-    rng = np.ptp(a)  # NumPy 2-safe
-    if rng == 0:
-        return np.zeros_like(a, dtype=float)
-    return (a - a.min()) / (rng + 1e-9)
+_faiss_index = None  # semantic index (optional)
 
 def rebuild_indices_and_embeddings():
-    """Build TF-IDF, BM25, and (optional) FAISS semantic index."""
+    """Build TF-IDF, BM25, and semantic index (if OpenAI+FAISS available)."""
     global _cached_ids, _cached_qs, _cached_as, _tfidf, _bm25, _faiss_index
     rows = get_all_faqs()
     _cached_ids = [r[0] for r in rows]
@@ -171,9 +174,8 @@ def rebuild_indices_and_embeddings():
         _tfidf = None
         _bm25 = None
 
-    # Build FAISS only if OpenAI key & faiss are available
+    # Semantic index (optional)
     if OPENAI_API_KEY and _HAS_OPENAI and _HAS_FAISS and _cached_qs:
-        from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
         with sqlite3.connect(DB) as c:
             existing = {row[0] for row in c.execute("SELECT faq_id FROM faq_embeddings").fetchall()}
@@ -211,7 +213,7 @@ def hybrid_rank(query: str) -> Tuple[Optional[int], float]:
     return (idx, float(score[idx]))
 
 def semantic_topk(query: str, k=3):
-    """Top-k indices via FAISS cosine similarity (if available)."""
+    """Top-k via FAISS cosine (if available); returns [(idx, score), ...]."""
     if not (_faiss_index is not None and OPENAI_API_KEY and _HAS_OPENAI and _HAS_FAISS and _cached_qs):
         return []
     client = OpenAI(api_key=OPENAI_API_KEY)
@@ -261,7 +263,7 @@ def entity_lookup(kind: str, name_query: str) -> Optional[str]:
 
 # ------------------- LLM -------------------
 def llm_answer(query: str, passages: List[Tuple[str, str]]) -> str:
-    """Strictly grounded LLM; never crashes if key/quota missing."""
+    """Grounded LLM answer; never crashes on key/quota errors."""
     if not (OPENAI_API_KEY and _HAS_OPENAI):
         return "I’m not sure yet."
     try:
@@ -288,7 +290,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hi! I’m your smart bot 🤖\n"
         "• Ask FAQs (price, refund policy, etc.)\n"
-        "• Birthdays: 'bday of Emmy', '/entity birthday | Emmy | January 14'\n"
+        "• Birthdays: 'bday of Emmy' (aliases supported)\n"
         "• Teach: /teach question | answer (admin)\n"
         "• Entities: /entity kind | name | value (admin)\n"
         "• Alias: /alias canonical | alias (admin)\n"
@@ -327,17 +329,17 @@ async def alias_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = get_all_faqs()
-    if not rows: return await update.message.reply_text("No FAQs yet. /teach question | answer")
+    if not rows:
+        return await update.message.reply_text("No FAQs yet. /teach question | answer")
     await update.message.reply_text("FAQ list:\n" + "\n".join(f"{rid}. {q}" for rid,q,_ in rows[:200]))
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update)
     raw = (update.message.text or "").strip()
     if not raw: return
-    text = norm(raw)
-    text_expanded = expand_synonyms(text)
 
-    # 1) Entities (birthday demo)
+    # 1) Entities (birthday)
+    text_expanded = expand_synonyms(norm(raw))
     name = detect_birthday(text_expanded)
     if name:
         val = entity_lookup("birthday", name)
@@ -351,7 +353,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3) Semantic + LLM fallback (optional)
     topk = semantic_topk(raw, k=3)
-    passages = [( _cached_qs[i], _cached_as[i]) for i,_ in topk]
+    passages = [(_cached_qs[i], _cached_as[i]) for i,_ in topk]
     if not passages and idx is not None:
         passages.append((_cached_qs[idx], _cached_as[idx]))
     answer = llm_answer(raw, passages)
@@ -359,7 +361,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- Bootstrap ----------------
 def preload():
-    # Seed minimal data once
+    # seed some data once
     if not get_all_faqs():
         add_faq("price", "Our base price is $25. Promos every Friday.")
         add_faq("cashapp", "Yes, we accept CashApp. Send $ to $YourTag and DM the receipt.")
@@ -382,7 +384,7 @@ def main():
     preload()
     rebuild_indices_and_embeddings()
 
-    # Start the tiny web server so Render Free stays live
+    # Keep-alive web server for Render Free
     Thread(target=run_flask, daemon=True).start()
 
     app = Application.builder().token(TOKEN).build()
